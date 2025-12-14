@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Logs / artifacts
+logs/
+*.log
+
+backend/.env
+backend/traces/
+backend/.venv/
+
+# Node / Vite
+frontend/.pytest_cache/
+frontend/dist/
+frontend/node_modules/
+frontend/.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Copilot
+.github/
