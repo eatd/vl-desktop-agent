@@ -14,14 +14,18 @@ export function LogPanel({ events }: LogPanelProps) {
     }, [events]);
 
     return (
-        <div className="card-glass" style={{ flex: 1, minHeight: 0 }}>
-            <div className="text-xs" style={{ textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>
-                Mission Log
+        <div className="card-glass" style={{ flex: 1, minHeight: 0, padding: 0, overflow: 'hidden' }}>
+            <div style={{ padding: '16px 16px 8px', borderBottom: '1px solid var(--border)' }}>
+                <span className="text-xs">Mission Log</span>
             </div>
             <div className="log-panel">
-                {events.map((e, i) => (
-                    <LogItem key={i} event={e} />
-                ))}
+                {events.length === 0 ? (
+                    <div style={{ color: 'var(--text-dim)', textAlign: 'center', padding: 20 }}>
+                        No events yet
+                    </div>
+                ) : (
+                    events.map((e, i) => <LogItem key={i} event={e} />)
+                )}
                 <div ref={logsEndRef} />
             </div>
         </div>
@@ -29,8 +33,7 @@ export function LogPanel({ events }: LogPanelProps) {
 }
 
 function LogItem({ event }: { event: EventEnvelope }) {
-    // Handle missing/invalid timestamp
-    const ts = event.ts || event.payload?.ts || Date.now() / 1000;
+    const ts = event.ts || Date.now() / 1000;
     const time = new Date(ts * 1000).toLocaleTimeString([], {
         hour12: false,
         hour: '2-digit',
@@ -45,16 +48,7 @@ function LogItem({ event }: { event: EventEnvelope }) {
         content = event.payload?.message || '';
     } else if (event.type === 'action') {
         typeClass = 'action';
-        // Get action type - check both 'action' and 'action_type' fields
-        const act = event.payload?.action?.action || event.payload?.action?.action_type || event.payload?.description || 'unknown';
-        const desc = event.payload?.description || '';
-
-        // Use description if available, otherwise construct from action
-        if (desc) {
-            content = desc;
-        } else {
-            content = `Action: ${act}`;
-        }
+        content = event.payload?.description || `Action: ${event.payload?.action?.action || 'unknown'}`;
     } else if (event.type === 'error') {
         typeClass = 'error';
         content = event.payload?.message || 'Error';
@@ -62,8 +56,7 @@ function LogItem({ event }: { event: EventEnvelope }) {
         typeClass = 'warning';
         content = event.payload?.message || 'Warning';
     } else if (event.type === 'status') {
-        typeClass = 'status';
-        content = 'Status update';
+        return null; // Don't show status updates in log
     }
 
     if (!content) return null;

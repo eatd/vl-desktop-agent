@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { connectEvents, fetchStatus, runGoal, stopGoal, type AgentStatus, type EventEnvelope, type EventsConnectionState } from './api';
 import { SettingsModal } from './SettingsModal';
-import { ControlPanel } from './components/ControlPanel';
 import { LogPanel } from './components/LogPanel';
 import { Preview } from './components/Preview';
-import { StatusBadge } from './components/StatusBadge';
 import './styles.css';
 
 interface ClickTarget {
@@ -13,7 +11,7 @@ interface ClickTarget {
 }
 
 export function App() {
-  const [goal, setGoal] = useState('Open Firefox and go to youtube.com');
+  const [goal, setGoal] = useState('');
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [jpegB64, setJpegB64] = useState<string | null>(null);
@@ -21,7 +19,12 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [clickTarget, setClickTarget] = useState<ClickTarget | null>(null);
 
+  const inputRef = useRef<HTMLInputElement>(null);
   const connRef = useRef<{ close: () => void } | null>(null);
+
+  const running = status?.running ?? false;
+  const maxSteps = 50;
+  const progressPct = Math.min(100, ((status?.step ?? 0) / maxSteps) * 100);
 
   useEffect(() => {
     fetchStatus().then(setStatus).catch(() => { });
@@ -30,87 +33,153 @@ export function App() {
   useEffect(() => {
     connRef.current = connectEvents(
       (evt) => {
-        // Process events for log display
-        if (evt.type === 'action' || evt.type === 'error' || evt.type === 'log' || evt.type === 'status' || evt.type === 'warning') {
-          setEvents((prev) => {
-            const next = [...prev, evt];
-            return next.slice(-200);
-          });
+        if (['action', 'error', 'log', 'status', 'warning'].includes(evt.type)) {
+          setEvents((prev) => [...prev, evt].slice(-100));
         }
-
         if (evt.type === 'status') setStatus(evt.payload);
         if (evt.type === 'preview') {
           setJpegB64(evt.payload?.jpeg_b64 ?? null);
-          if (evt.payload?.status) {
-            setStatus((prev) => prev ? { ...prev, ...evt.payload.status } : evt.payload.status);
-          }
+          if (evt.payload?.status) setStatus(s => s ? { ...s, ...evt.payload.status } : evt.payload.status);
         }
-
-        // Handle click target from action events
         if (evt.type === 'action' && evt.payload?.click_target) {
           setClickTarget(evt.payload.click_target);
         }
       },
       (state) => {
         setConnState(state);
-        const connectMsg = state === 'open' ? 'Connected to agent events' : `Connection state: ${state}`;
-        setEvents((prev) => [...prev, { type: 'log', ts: Date.now() / 1000, payload: { message: connectMsg } }]);
       }
     );
-
     return () => connRef.current?.close();
   }, []);
 
-  const running = status?.running ?? false;
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && running) {
+        e.preventDefault();
+        onStop();
+      }
+      if (e.key === ',' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        setShowSettings(true);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [running]);
 
   const onRun = useCallback(async () => {
-    if (!goal.trim()) return;
-    setClickTarget(null); // Clear old markers
-    setEvents(p => [...p, { type: 'log', ts: Date.now() / 1000, payload: { message: `Goal started: ${goal}` } }]);
+    if (!goal.trim() || running) return;
+    setClickTarget(null);
+    setEvents([]);
     const res = await runGoal(goal);
-    if (!res.ok && res.error) {
-      setEvents((prev) => [...prev, { type: 'error', ts: Date.now() / 1000, payload: { message: res.error } }]);
-    }
     setStatus(res.status);
-  }, [goal]);
+  }, [goal, running]);
 
   const onStop = useCallback(async () => {
     const res = await stopGoal();
-    setEvents(p => [...p, { type: 'log', ts: Date.now() / 1000, payload: { message: 'Stop requested...' } }]);
     setStatus(res.status);
   }, []);
 
-  return (
-    <div className="app-container fade-in">
-      <div className="sidebar">
-        <ControlPanel
-          goal={goal}
-          setGoal={setGoal}
-          running={running}
-          onRun={onRun}
-          onStop={onStop}
-          onSettings={() => setShowSettings(true)}
-        />
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !running) {
+      onRun();
+    }
+  };
 
-        <div className="card-glass">
-          <div className="text-xs" style={{ textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>Status</div>
-          <div className="status-grid">
-            <StatusBadge label="State" value={running ? 'BUSY' : 'IDLE'} active={running} />
-            <StatusBadge label="Step" value={status?.step ?? 0} />
-            <StatusBadge label="WebSock" value={connState} active={connState === 'open'} />
-            <StatusBadge label="Dry Run" value={String(status?.dry_run ?? false)} />
+  return (
+    <div className="app-root">
+      {/* Header */}
+      <header className="app-header">
+        <div className="header-left">
+          <span className="logo">🤖</span>
+          <h1>VL Desktop Agent</h1>
+        </div>
+        <div className="header-right">
+          <div className={`conn-indicator ${connState === 'open' ? 'connected' : ''}`}>
+            <span className="conn-dot" />
+            {connState === 'open' ? 'Connected' : 'Connecting...'}
           </div>
-          {status?.last_action && (
-            <StatusBadge label="Last Action" value={status.last_action} column />
-          )}
+          <button className="icon-btn" onClick={() => setShowSettings(true)} title="Settings (Ctrl+,)">
+            ⚙️
+          </button>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <div className="app-main">
+        {/* Left Panel */}
+        <div className="left-panel">
+          {/* Goal Input */}
+          <div className="card-glass goal-card">
+            <label className="input-label">What should I do?</label>
+            <input
+              ref={inputRef}
+              type="text"
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="e.g. Open Chrome and go to youtube.com"
+              disabled={running}
+            />
+
+            {/* Action Buttons */}
+            <div className="action-buttons">
+              {!running ? (
+                <button className="btn-primary" onClick={onRun} disabled={!goal.trim()}>
+                  ▶ Run Goal
+                </button>
+              ) : (
+                <button className="btn-danger" onClick={onStop}>
+                  ⏹ Stop
+                </button>
+              )}
+            </div>
+
+            {/* Progress Bar */}
+            {running && (
+              <div className="progress-container">
+                <div className="progress-bar" style={{ width: `${progressPct}%` }} />
+                <span className="progress-text">Step {status?.step ?? 0} / {maxSteps}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Status Card */}
+          <div className="card-glass status-card">
+            <div className="status-row">
+              <span className="status-label">Status</span>
+              <span className={`status-value ${running ? 'active' : ''}`}>
+                {running ? '🟢 Running' : '⚪ Idle'}
+              </span>
+            </div>
+            {status?.last_action && (
+              <div className="status-row">
+                <span className="status-label">Last Action</span>
+                <span className="status-value mono">{status.last_action}</span>
+              </div>
+            )}
+            {status?.dry_run && (
+              <div className="dry-run-badge">DRY RUN</div>
+            )}
+          </div>
+
+          {/* Log Panel */}
+          <LogPanel events={events} />
         </div>
 
-        <LogPanel events={events} />
+        {/* Preview */}
+        <Preview jpegB64={jpegB64} clickTarget={clickTarget} />
       </div>
 
-      <Preview jpegB64={jpegB64} clickTarget={clickTarget} />
-
+      {/* Settings Modal */}
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+
+      {/* Keyboard hints */}
+      <div className="keyboard-hints">
+        <span>Enter = Run</span>
+        <span>Esc = Stop</span>
+        <span>Ctrl+, = Settings</span>
+      </div>
     </div>
   );
 }

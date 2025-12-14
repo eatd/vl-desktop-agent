@@ -24,7 +24,7 @@ import openai
 from .config import settings
 from .executor import execute
 from .models import Action, AgentStatus, Event
-from .prompts import build_prompt, REFLECTION_PROMPT
+from .prompts import build_prompt, build_observation_prompt, build_reflection_prompt
 from .trace import save_step, save_session
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,7 @@ class Agent:
         self._session_id: Optional[str] = None
         self._stuck_count = 0  # Consecutive failed verifications
         self._last_raw_response = ""  # Raw model output for logging
+        self._screen_state = ""  # Observation phase result
     
     def status(self) -> AgentStatus:
         with self._lock:
@@ -139,14 +140,14 @@ class Agent:
                 self._finalize("max_steps")
                 continue
             
+
             # 1. CAPTURE (before)
-            frame_before = self._capture.get_latest()
+            frame_before = self._capture.get_latest() # Get latest frame from capture 
             if frame_before is None:
                 time.sleep(0.1)
                 continue
             
-            resized = resize_frame(frame_before)
-            image_b64 = encode_image(resized)
+            image_b64 = encode_image(frame_before)
             
             # Send preview to UI
             publish(Event(
@@ -157,7 +158,15 @@ class Agent:
                 },
             ))
             
-            # 2. INFER (with confidence check)
+            # 2. OBSERVE (Phase 1: Describe screen state)
+            # Only do observation every 3 steps to save API calls
+            if self._step % 3 == 0 or self._stuck_count > 0:
+                self._screen_state = self._observe_screen(image_b64, goal)
+                publish(Event(type="log", payload={
+                    "message": f"[OBSERVE] {self._screen_state[:80]}..."
+                }))
+            
+            # 3. INFER (Phase 2: Decide action based on observation)
             try:
                 action = self._get_confident_action(image_b64, goal)
             except Exception as e:
@@ -177,16 +186,17 @@ class Agent:
             self._last_action = desc
             
             # 4. VERIFY (check if UI changed)
-            self._last_frame_change = 0.0
+            self._last_frame_change = 0.0 # 
+              
             if action.action not in ("done", "scroll"):
                 time.sleep(0.4)  # Wait for UI to update
                 frame_after = self._capture.get_latest()
-                
-                if frame_after is not None:
-                    change = frame_diff(
-                        resize_frame(frame_before),
-                        resize_frame(frame_after)
-                    )
+
+                if frame_after is not None: # Check if frame_after is not None 
+                    
+                    # Calculate frame difference 
+                    change = frame_diff(frame_before, frame_after)
+
                     self._last_frame_change = change
                     
                     if change < FRAME_DIFF_THRESHOLD:
@@ -213,7 +223,7 @@ class Agent:
                 save_step(
                     session_id, 
                     self._step, 
-                    resized, 
+                    frame_before,
                     action.model_dump(),
                     raw_response=self._last_raw_response,
                     frame_change=change_pct,
@@ -250,7 +260,8 @@ class Agent:
     ) -> Optional[Action]:
         """Get action with confidence >= threshold, or retry."""
         for attempt in range(max_attempts):
-            action = self._call_model(image_b64, goal)
+            # Pass screen state from observation phase
+            action = self._call_model(image_b64, goal, self._screen_state)
             
             if action is None:
                 continue
@@ -262,19 +273,14 @@ class Agent:
         
         return None
     
-    def _reflect_and_correct(self, image_b64: str, goal: str) -> None:
-        """Reflect on failures and suggest correction."""
-        failed = [h for h in self._history[-5:] if "[NO EFFECT]" in h]
+    def _observe_screen(self, image_b64: str, goal: str) -> str:
+        """
+        Phase 1: Observe and describe the current screen state.
         
-        if not failed:
-            return
-        
-        # Build reflection prompt
-        prompt = REFLECTION_PROMPT.format(
-            n=len(failed),
-            failed_actions="\n".join(failed),
-            goal=goal,
-        )
+        This forces the model to LOOK before acting, improving
+        state awareness and reducing repetitive actions.
+        """
+        prompt = build_observation_prompt(goal)
         
         try:
             response = self._client.chat.completions.create(
@@ -282,7 +288,40 @@ class Agent:
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": [
-                        {"type": "text", "text": "Current screen:"},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_b64}"
+                        }},
+                    ]},
+                ],
+                max_tokens=150,
+                temperature=0,
+            )
+            
+            state = response.choices[0].message.content or ""
+            logger.debug(f"Screen observation: {state[:100]}")
+            return state.strip()
+            
+        except Exception as e:
+            logger.warning(f"Observation phase failed: {e}")
+            return ""
+    
+    def _reflect_and_correct(self, image_b64: str, goal: str) -> None:
+        """Reflect on failures and suggest correction."""
+        failed = [h for h in self._history[-5:] if "[NO EFFECT]" in h]
+        
+        if not failed:
+            return
+        
+        # Build reflection prompt with screen state
+        prompt = build_reflection_prompt(goal, failed, self._screen_state)
+        
+        try:
+            response = self._client.chat.completions.create(
+                model=settings.model,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "Suggest a different action:"},
                         {"type": "image_url", "image_url": {
                             "url": f"data:image/jpeg;base64,{image_b64}"
                         }},
@@ -302,16 +341,16 @@ class Agent:
         except Exception as e:
             logger.error(f"Reflection failed: {e}")
     
-    def _call_model(self, image_b64: str, goal: str) -> Optional[Action]:
-        """Call VLM and parse response."""
-        prompt = build_prompt(goal, self._history)
+    def _call_model(self, image_b64: str, goal: str, screen_state: str = "") -> Optional[Action]:
+        """Call VLM and parse response (Phase 2: Action)."""
+        prompt = build_prompt(goal, self._history, screen_state)
         
         response = self._client.chat.completions.create(
             model=settings.model,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": [
-                    {"type": "text", "text": "Current screen:"},
+                    {"type": "text", "text": "What is the next action?"},
                     {"type": "image_url", "image_url": {
                         "url": f"data:image/jpeg;base64,{image_b64}"
                     }},
