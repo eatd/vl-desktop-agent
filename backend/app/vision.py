@@ -1,96 +1,110 @@
 """
-Screen capture using DXCam (Windows) or MSS (cross-platform).
+On-Demand Screen Capture.
+
+Refactored from threaded/polling model to request-response model
+to save resources and ensure frame freshness.
 """
 from __future__ import annotations
 
-import threading
-from typing import Optional
-
-import mss
+import logging
+from typing import Optional, Tuple
 import numpy as np
+import mss
 
-# TODO: Make this configurable
+# DXCam is Windows only
 try:
     import DXCam
     HAS_DXCAM = True
 except ImportError:
     HAS_DXCAM = False
 
+logger = logging.getLogger(__name__)
 
-class ContinuousCapture:
-    """Background thread that captures screenshots."""
+class OnDemandCapture:
+    """Captures screen frames only when requested."""
     
-    def __init__(
-        self,
-        use_dxcam: bool = False,
-        monitor_index: int = 1,
-        fps: float = 5.0,
-    ) -> None:
-        self._lock = threading.Lock()
-        self._latest: Optional[np.ndarray] = None
-        self._stop = threading.Event()
-        self._interval = 1.0 / fps if fps > 0 else 0.1
-        self._monitor_index = monitor_index
+    def __init__(self, use_dxcam: bool = False, monitor_index: int = 1) -> None:
+        self.use_dxcam = use_dxcam and HAS_DXCAM
+        self.monitor_index = monitor_index
+        self._cam = None
         
-        # Initialize backend
-        # 
-        if use_dxcam and HAS_DXCAM:
-            self._cam = DXCam.create(output_idx=0, output_color="BGR") 
-            self._use_dxcam = True
-        else:
-            self._cam = None
-            self._use_dxcam = False
-        
-        # Start thread
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-    
-    def get_latest(self) -> Optional[np.ndarray]:
-        """Get most recent frame."""
-        with self._lock:
-            return self._latest.copy() if self._latest is not None else None
-    
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=2.0)
-    
-    def _run(self) -> None:
-        if self._use_dxcam:
-            self._dxcam_loop()
-        else:
-            self._mss_loop()
-    
-    def _dxcam_loop(self) -> None:
-        while not self._stop.is_set():
+        if self.use_dxcam:
             try:
-                frame = self._cam.grab()
-                if frame is not None:
-                    with self._lock:
-                        self._latest = frame
-            except Exception:
-                pass
-            self._stop.wait(self._interval)
-        
-        try:
-            self._cam.release()
-        except Exception:
-            pass
+                # Initialize DXCam once
+                self._cam = DXCam.create(output_idx=monitor_index-1, output_color="BGR")
+                logger.info(f"Initialized DXCam on monitor {monitor_index}")
+            except Exception as e:
+                logger.error(f"DXCam failed to init, falling back to MSS: {e}")
+                self.use_dxcam = False
     
-    def _mss_loop(self) -> None:
+    def capture(self) -> Optional[np.ndarray]:
+        """
+        Capture a single frame immediately.
+        
+        Returns:
+            np.ndarray: BGR image or None if capture failed.
+        """
+        if self.use_dxcam and self._cam is not None:
+            return self._capture_dxcam()
+        return self._capture_mss()
+    
+    def _capture_dxcam(self) -> Optional[np.ndarray]:
+        # DXCam needs a 'grab' call. If the screen hasn't changed, 
+        # it might return None depending on settings, but usually it blocks.
+        # We use .grab() which is efficient.
+        try:
+            frame = self._cam.grab()
+            if frame is None:
+                # If None, it means no change or timeout. 
+                # For an agent, we force a frame if possible, but DXCam is quirky.
+                # Often it's better to restart or just return None.
+                pass
+            return frame
+        except Exception as e:
+            logger.error(f"DXCam capture error: {e}")
+            return None
+
+    def _capture_mss(self) -> Optional[np.ndarray]:
         with mss.mss() as sct:
-            monitors = sct.monitors
-            monitor = monitors[min(self._monitor_index, len(monitors) - 1)]
-            
-            while not self._stop.is_set():
-                try:
-                    img = sct.grab(monitor)
-                    
-                    frame = np.asarray(img)[:, :, :3]  # BGRA → BGR 
-                    frame = np.ascontiguousarray(frame)
-                    
-                    with self._lock:
-                        self._latest = frame
-                except Exception:
-                    pass
+            try:
+                monitors = sct.monitors
+                if self.monitor_index >= len(monitors):
+                    logger.warning(f"Monitor index {self.monitor_index} out of range, using 1")
+                    target = monitors[1]
+                else:
+                    target = monitors[self.monitor_index]
                 
-                self._stop.wait(self._interval)
+                # grab() returns BGRA
+                screenshot = sct.grab(target)
+                img = np.array(screenshot)
+                
+                # Convert BGRA to BGR
+                return img[:, :, :3]
+            except Exception as e:
+                logger.error(f"MSS capture error: {e}")
+                return None
+
+    def get_resolution(self) -> Tuple[int, int]:
+        """Return (width, height) of the capture target."""
+        if self.use_dxcam and self._cam:
+             # DXCam doesn't easily expose size without capturing, 
+             # but we can try capturing one frame.
+             frame = self.capture()
+             if frame is not None:
+                 return frame.shape[1], frame.shape[0]
+             return (1920, 1080) # Fallback
+
+        with mss.mss() as sct:
+            try:
+                monitors = sct.monitors
+                target = monitors[min(self.monitor_index, len(monitors)-1)]
+                return target["width"], target["height"]
+            except:
+                return (1920, 1080)
+
+    def release(self):
+        if self.use_dxcam and self._cam:
+            try:
+                self._cam.release()
+            except:
+                pass
